@@ -1,0 +1,1780 @@
+-- Vanish Anti Packet Lagger v4
+-- Limits your own outgoing FireServer rate and flags other players who look like lag switchers.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Stats = game:GetService("Stats")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then return end
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local GUI_NAME = "VanishAntiPacketLagger"
+
+local GuiParent = PlayerGui
+if GuiParent:FindFirstChild(GUI_NAME) or PlayerGui:FindFirstChild(GUI_NAME) then
+    warn("[Vanish] Already running - use the VANISH pill or RightShift")
+    return
+end
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+local ACCENTS = {
+    Color3.fromRGB(124, 92, 255),
+    Color3.fromRGB(64, 156, 255),
+    Color3.fromRGB(60, 220, 140),
+    Color3.fromRGB(255, 95, 160),
+    Color3.fromRGB(255, 160, 60),
+    Color3.fromRGB(225, 230, 255),
+}
+
+local BACKGROUNDS = {
+    "rbxassetid://136102941611031",
+    "rbxassetid://126836814104648",
+    "rbxassetid://113066671567217",
+    "rbxassetid://90742337592784",
+    "rbxassetid://103981252715138",
+    "rbxassetid://99152937872371",
+    "rbxassetid://122784193969238",
+    "rbxassetid://139441110677603",
+    "rbxassetid://107924157410781",
+    "rbxassetid://81716347974946",
+    "rbxassetid://136094657712452",
+    "rbxassetid://80469907559370",
+    "rbxassetid://91444821153663",
+    "rbxassetid://113802640695350",
+    "rbxassetid://81861129614949",
+}
+
+local CONFIG_FILE = "vanish_anti_packet_lagger.json"
+local LEGACY_CONFIG_FILE = "xefew_anti_packet_lagger.json"
+
+local config = {
+    accent = 1,
+    bg = 1,
+    bgOpacity = 60,
+    scale = 100,
+    autoScale = true,
+    burst = 40,
+    pps = 60,
+    enabled = true,
+    sens = 2,
+    highlight = true,
+    alerts = true,
+}
+
+pcall(function()
+    if not (isfile and readfile) then return end
+    local file = nil
+    if isfile(CONFIG_FILE) then
+        file = CONFIG_FILE
+    elseif isfile(LEGACY_CONFIG_FILE) then
+        file = LEGACY_CONFIG_FILE
+    end
+    if not file then return end
+    local data = HttpService:JSONDecode(readfile(file))
+    for k, v in pairs(data) do
+        if config[k] ~= nil and type(v) == type(config[k]) then
+            config[k] = v
+        end
+    end
+end)
+
+local function clampInt(v, lo, hi)
+    return math.clamp(math.floor(v + 0.5), lo, hi)
+end
+
+config.accent = clampInt(config.accent, 1, #ACCENTS)
+config.bg = clampInt(config.bg, 1, #BACKGROUNDS)
+config.bgOpacity = clampInt(config.bgOpacity, 0, 100)
+config.scale = clampInt(config.scale, 50, 120)
+config.burst = clampInt(config.burst, 10, 80)
+config.pps = clampInt(config.pps, 10, 120)
+config.sens = clampInt(config.sens, 1, 3)
+
+local saveQueued = false
+local function saveConfig()
+    if not writefile or saveQueued then return end
+    saveQueued = true
+    task.delay(1, function()
+        saveQueued = false
+        pcall(function()
+            writefile(CONFIG_FILE, HttpService:JSONEncode(config))
+        end)
+    end)
+end
+
+-- ============================================================
+-- State and connection tracking
+-- ============================================================
+
+local state = {
+    MaxPPS = config.pps,
+    BurstLimit = config.burst,
+    Enabled = config.enabled,
+    Log = false,
+    Highlight = config.highlight,
+    Alerts = config.alerts,
+    totalDropped = 0,
+    locked = false,
+    ping = 0,
+    selfLagging = false,
+    flagged = {},
+    hookOk = false,
+    unloaded = false,
+    onFlag = nil,
+}
+
+local conns = {}
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    conns[#conns + 1] = c
+    return c
+end
+
+-- ============================================================
+-- Remote limiter (token bucket on FireServer)
+-- ============================================================
+
+local bucket = { tokens = state.BurstLimit, last = os.clock() }
+local isOwnCall = checkcaller or function() return false end
+
+local function shouldAllow(now)
+    if not state.Enabled then return true end
+
+    local elapsed = now - bucket.last
+    bucket.last = now
+    bucket.tokens = math.min(state.BurstLimit, bucket.tokens + elapsed * state.MaxPPS)
+
+    if bucket.tokens >= 1 then
+        bucket.tokens -= 1
+        return true
+    end
+
+    state.totalDropped += 1
+    if state.Log then
+        warn("[Vanish] Remote call limited")
+    end
+    return false
+end
+
+local oldNamecall
+local function hookFn(self, ...)
+    if state.Enabled and not state.unloaded
+        and getnamecallmethod() == "FireServer"
+        and not isOwnCall()
+        and not shouldAllow(os.clock()) then
+        return
+    end
+    return oldNamecall(self, ...)
+end
+
+state.hookOk = pcall(function()
+    local wrap = newcclosure or function(f) return f end
+    if hookmetamethod then
+        oldNamecall = hookmetamethod(game, "__namecall", wrap(hookFn))
+    else
+        local mt = getrawmetatable(game)
+        setreadonly(mt, false)
+        oldNamecall = mt.__namecall
+        mt.__namecall = wrap(hookFn)
+        setreadonly(mt, true)
+    end
+end)
+
+if not state.hookOk or not oldNamecall then
+    state.hookOk = false
+    warn("[Vanish] Remote hook failed - limiter off, lag detector still running")
+end
+
+-- ============================================================
+-- Lag switch detector
+-- ============================================================
+
+local DETECT = { FreezeTime = 0.40, MinSpeed = 10, JumpStuds = 10, FlagHold = 5 }
+
+local SENS = {
+    { FreezeTime = 0.60, MinSpeed = 12, JumpStuds = 14 },
+    { FreezeTime = 0.40, MinSpeed = 10, JumpStuds = 10 },
+    { FreezeTime = 0.25, MinSpeed = 8,  JumpStuds = 7  },
+}
+
+local function applySens(i)
+    local p = SENS[i]
+    DETECT.FreezeTime = p.FreezeTime
+    DETECT.MinSpeed = p.MinSpeed
+    DETECT.JumpStuds = p.JumpStuds
+end
+applySens(config.sens)
+
+local tracks = {}
+local selfLagUntil = 0
+local lastBeat = os.clock()
+
+local pingItem = nil
+local nextPingLookup = 0
+local function readPing(now)
+    if not pingItem then
+        if now < nextPingLookup then return 0 end
+        nextPingLookup = now + 2
+        local ok, item = pcall(function()
+            return Stats.Network.ServerStatsItem["Data Ping"]
+        end)
+        if ok and item then
+            pingItem = item
+        else
+            return 0
+        end
+    end
+    local ok, v = pcall(pingItem.GetValue, pingItem)
+    return (ok and tonumber(v)) or 0
+end
+
+local function setHighlight(t, on)
+    if on then
+        if (not t.hl or not t.hl.Parent) and t.char then
+            local hl = Instance.new("Highlight")
+            hl.Name = "VanishLagFlag"
+            hl.FillColor = Color3.fromRGB(255, 60, 60)
+            hl.FillTransparency = 0.6
+            hl.OutlineColor = Color3.fromRGB(255, 60, 60)
+            hl.Parent = t.char
+            t.hl = hl
+        end
+    elseif t.hl then
+        t.hl:Destroy()
+        t.hl = nil
+    end
+end
+
+local function clearTrack(plr)
+    local t = tracks[plr]
+    if t then
+        setHighlight(t, false)
+        tracks[plr] = nil
+    end
+end
+
+local playerList = {}
+local function rebuildPlayers()
+    table.clear(playerList)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            playerList[#playerList + 1] = p
+        end
+    end
+end
+rebuildPlayers()
+
+connect(Players.PlayerAdded, function()
+    rebuildPlayers()
+end)
+connect(Players.PlayerRemoving, function(plr)
+    clearTrack(plr)
+    task.defer(rebuildPlayers)
+end)
+
+connect(RunService.Heartbeat, function()
+    if state.unloaded then return end
+
+    local now = os.clock()
+    local dt = now - lastBeat
+    lastBeat = now
+
+    local ping = readPing(now)
+    state.ping = ping
+
+    if dt > 0.2 or ping > 450 then
+        selfLagUntil = now + 1.5
+    end
+    local selfLagging = now < selfLagUntil
+    state.selfLagging = selfLagging
+
+    local flaggedList = state.flagged
+    table.clear(flaggedList)
+
+    for i = 1, #playerList do
+        local plr = playerList[i]
+        local char = plr.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+        if not hrp then
+            clearTrack(plr)
+        else
+            local t = tracks[plr]
+            if not t or t.char ~= char then
+                if t then setHighlight(t, false) end
+                t = {
+                    char = char,
+                    pos = hrp.Position,
+                    lastChange = now,
+                    lastVel = 0,
+                    flagUntil = 0,
+                    spikes = 0,
+                    status = "OK",
+                    wasFlagged = false,
+                    lastToast = -100,
+                }
+                tracks[plr] = t
+            end
+
+            local pos = hrp.Position
+            local delta = (pos - t.pos).Magnitude
+
+            if selfLagging then
+                t.pos = pos
+                t.lastChange = now
+                t.lastVel = 0
+            elseif delta > 0.05 then
+                local gap = now - t.lastChange
+                if gap >= DETECT.FreezeTime
+                    and t.lastVel >= DETECT.MinSpeed
+                    and delta >= DETECT.JumpStuds then
+                    t.spikes += 1
+                    t.flagUntil = now + DETECT.FlagHold
+                    if state.Log then
+                        warn(string.format("[Vanish] %s lag spike: froze %.2fs, snapped %.0f studs", plr.Name, gap, delta))
+                    end
+                end
+                t.pos = pos
+                t.lastChange = now
+                t.lastVel = hrp.AssemblyLinearVelocity.Magnitude
+            end
+
+            local frozen = (not selfLagging)
+                and (now - t.lastChange) >= DETECT.FreezeTime
+                and t.lastVel >= DETECT.MinSpeed
+
+            local status = "OK"
+            if now < t.flagUntil then
+                status = "SPIKE"
+            elseif frozen then
+                status = "FROZEN"
+            end
+            t.status = status
+            local flagged = status ~= "OK"
+
+            setHighlight(t, flagged and state.Highlight)
+
+            if flagged and not t.wasFlagged and (now - t.lastToast) > 8 then
+                t.lastToast = now
+                if state.onFlag then
+                    pcall(state.onFlag, plr, t)
+                end
+            end
+            t.wasFlagged = flagged
+
+            if flagged then
+                flaggedList[#flaggedList + 1] = plr
+            end
+        end
+    end
+end)
+
+local ScreenGui
+local uiOk, uiErr = xpcall(function()
+
+-- ============================================================
+-- UI helpers
+-- ============================================================
+
+local BG = Color3.fromRGB(12, 12, 17)
+local PANEL = Color3.fromRGB(18, 18, 25)
+local CARD = Color3.fromRGB(25, 25, 35)
+local CONTROL = Color3.fromRGB(38, 38, 52)
+local CONTROL_HOVER = Color3.fromRGB(48, 48, 64)
+local TEXT = Color3.fromRGB(236, 236, 246)
+local MUTED = Color3.fromRGB(144, 144, 164)
+local GOOD = Color3.fromRGB(70, 220, 130)
+local WARN = Color3.fromRGB(255, 190, 70)
+local BAD = Color3.fromRGB(255, 85, 85)
+local WHITE = Color3.new(1, 1, 1)
+local TRACK_OFF = Color3.fromRGB(55, 55, 68)
+
+local infoCache = {}
+local function tweenInfo(t, style)
+    style = style or Enum.EasingStyle.Quad
+    local key = tostring(t) .. style.Name
+    local info = infoCache[key]
+    if not info then
+        info = TweenInfo.new(t, style, Enum.EasingDirection.Out)
+        infoCache[key] = info
+    end
+    return info
+end
+
+local function tween(o, t, props, style)
+    local tw = TweenService:Create(o, tweenInfo(t, style), props)
+    tw:Play()
+    return tw
+end
+
+local function make(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do
+        o[k] = v
+    end
+    o.Parent = parent
+    return o
+end
+
+local function corner(o, r)
+    return make("UICorner", { CornerRadius = UDim.new(0, r) }, o)
+end
+
+local function stroke(o, color, transparency, thickness)
+    return make("UIStroke", {
+        Color = color,
+        Transparency = transparency,
+        Thickness = thickness or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, o)
+end
+
+local function label(parent, props)
+    local p = {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        TextColor3 = TEXT,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }
+    for k, v in pairs(props) do
+        p[k] = v
+    end
+    return make("TextLabel", p, parent)
+end
+
+local function caption(parent, text)
+    return label(parent, {
+        Size = UDim2.new(1, 0, 0, 14),
+        Text = text,
+        TextSize = 10,
+        TextColor3 = MUTED,
+        Font = Enum.Font.GothamBold,
+    })
+end
+
+local function card(parent, height)
+    local f = make("Frame", {
+        Size = UDim2.new(1, 0, 0, height),
+        BackgroundColor3 = CARD,
+        BackgroundTransparency = 0.2,
+        BorderSizePixel = 0,
+    }, parent)
+    corner(f, 9)
+    stroke(f, WHITE, 0.94, 1)
+    return f
+end
+
+local function hoverable(btn, base, hover)
+    btn.MouseEnter:Connect(function()
+        tween(btn, 0.12, { BackgroundColor3 = hover })
+    end)
+    btn.MouseLeave:Connect(function()
+        tween(btn, 0.12, { BackgroundColor3 = base })
+    end)
+end
+
+local accent = ACCENTS[config.accent]
+local accentHooks = {}
+
+local function onAccent(fn)
+    accentHooks[#accentHooks + 1] = fn
+end
+
+local function bindAccent(obj, prop)
+    obj[prop] = accent
+    onAccent(function(c)
+        if obj.Parent then
+            tween(obj, 0.25, { [prop] = c })
+        end
+    end)
+end
+
+local function setAccent(i)
+    accent = ACCENTS[i]
+    config.accent = i
+    for _, fn in ipairs(accentHooks) do
+        fn(accent)
+    end
+    saveConfig()
+end
+
+-- One shared drag handler for the window, the pill and every slider.
+local activeDrag = nil
+local function isPointerStart(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+connect(UserInputService.InputChanged, function(input)
+    if activeDrag and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        activeDrag(input.Position)
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if activeDrag and isPointerStart(input) then
+        activeDrag = nil
+    end
+end)
+
+local function viewport()
+    local cam = workspace.CurrentCamera
+    return cam and cam.ViewportSize or Vector2.new(1280, 720)
+end
+
+local WIN_W, WIN_H = 372, 468
+
+-- Phone or tablet without a keyboard counts as mobile.
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+local function effectiveScale()
+    if not config.autoScale then
+        return config.scale / 100
+    end
+    local vp = viewport()
+    local base = isMobile and 0.8 or 1
+    local fit = math.min((vp.X - 24) / WIN_W, (vp.Y - 24) / WIN_H)
+    return math.clamp(math.min(base, fit), 0.5, 1)
+end
+
+local function makeDraggable(handle, target, canDrag, clampFn)
+    local moved = false
+    handle.InputBegan:Connect(function(input)
+        if not isPointerStart(input) then return end
+        if canDrag and not canDrag() then return end
+        moved = false
+        local dragStart = input.Position
+        local startPos = target.Position
+        activeDrag = function(pos)
+            local d = pos - dragStart
+            if math.abs(d.X) > 6 or math.abs(d.Y) > 6 then
+                moved = true
+            end
+            local x = startPos.X.Offset + d.X
+            local y = startPos.Y.Offset + d.Y
+            if clampFn then
+                x, y = clampFn(x, y)
+            end
+            target.Position = UDim2.new(startPos.X.Scale, x, startPos.Y.Scale, y)
+        end
+    end)
+    return function()
+        return moved
+    end
+end
+
+-- ============================================================
+-- Window
+-- ============================================================
+
+
+ScreenGui = make("ScreenGui", {
+    Name = GUI_NAME,
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    IgnoreGuiInset = true,
+    DisplayOrder = 100,
+})
+
+local Root = make("Frame", {
+    Name = "Root",
+    Size = UDim2.new(0, WIN_W, 0, WIN_H),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    BackgroundTransparency = 1,
+}, ScreenGui)
+
+local UserScale = make("UIScale", { Scale = effectiveScale() }, Root)
+
+local extraScales = {}
+local function applyUiScale(s)
+    UserScale.Scale = s
+    for _, sc in ipairs(extraScales) do
+        sc.Scale = math.min(s, 1)
+    end
+end
+
+local Main = make("CanvasGroup", {
+    Name = "Main",
+    Size = UDim2.new(1, 0, 1, 0),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    BackgroundColor3 = BG,
+    BorderSizePixel = 0,
+    GroupTransparency = 0,
+}, Root)
+corner(Main, 14)
+stroke(Main, WHITE, 0.88, 1)
+
+local OpenScale = make("UIScale", { Scale = 1 }, Main)
+
+local BgImage = make("ImageLabel", {
+    Name = "Background",
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundTransparency = 1,
+    Image = BACKGROUNDS[config.bg],
+    ScaleType = Enum.ScaleType.Crop,
+    ImageTransparency = 1 - config.bgOpacity / 100,
+}, Main)
+
+make("Frame", {
+    Name = "Overlay",
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundColor3 = BG,
+    BackgroundTransparency = 0.25,
+    BorderSizePixel = 0,
+}, Main)
+
+-- Header
+local TitleBar = make("Frame", {
+    Name = "Header",
+    Size = UDim2.new(1, 0, 0, 48),
+    BackgroundColor3 = PANEL,
+    BackgroundTransparency = 0.15,
+    BorderSizePixel = 0,
+}, Main)
+
+make("Frame", {
+    Size = UDim2.new(1, 0, 0, 1),
+    Position = UDim2.new(0, 0, 1, -1),
+    BackgroundColor3 = WHITE,
+    BackgroundTransparency = 0.92,
+    BorderSizePixel = 0,
+}, TitleBar)
+
+local Logo = make("Frame", {
+    Size = UDim2.new(0, 28, 0, 28),
+    Position = UDim2.new(0, 12, 0, 10),
+    BorderSizePixel = 0,
+}, TitleBar)
+corner(Logo, 8)
+bindAccent(Logo, "BackgroundColor3")
+label(Logo, {
+    Size = UDim2.new(1, 0, 1, 0),
+    Text = "V",
+    Font = Enum.Font.GothamBlack,
+    TextSize = 15,
+    TextColor3 = WHITE,
+    TextXAlignment = Enum.TextXAlignment.Center,
+})
+
+label(TitleBar, {
+    Size = UDim2.new(1, -140, 0, 16),
+    Position = UDim2.new(0, 48, 0, 8),
+    Text = "VANISH",
+    Font = Enum.Font.GothamBlack,
+    TextSize = 13,
+})
+label(TitleBar, {
+    Size = UDim2.new(1, -140, 0, 14),
+    Position = UDim2.new(0, 48, 0, 25),
+    Text = "Anti Packet Lagger",
+    TextSize = 10,
+    TextColor3 = MUTED,
+})
+
+local LockBtn = make("TextButton", {
+    Size = UDim2.new(0, 28, 0, 28),
+    Position = UDim2.new(1, -70, 0, 10),
+    BackgroundColor3 = CONTROL,
+    Text = "🔓",
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextColor3 = TEXT,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+}, TitleBar)
+corner(LockBtn, 8)
+
+local CloseBtn = make("TextButton", {
+    Size = UDim2.new(0, 28, 0, 28),
+    Position = UDim2.new(1, -38, 0, 10),
+    BackgroundColor3 = CONTROL,
+    Text = "–",
+    Font = Enum.Font.GothamBold,
+    TextSize = 18,
+    TextColor3 = TEXT,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+}, TitleBar)
+corner(CloseBtn, 8)
+hoverable(CloseBtn, CONTROL, Color3.fromRGB(120, 45, 55))
+
+local LOCK_ON = Color3.fromRGB(90, 45, 55)
+LockBtn.MouseButton1Click:Connect(function()
+    state.locked = not state.locked
+    LockBtn.Text = state.locked and "🔒" or "🔓"
+    tween(LockBtn, 0.15, { BackgroundColor3 = state.locked and LOCK_ON or CONTROL })
+end)
+
+makeDraggable(TitleBar, Root, function()
+    return not state.locked
+end, function(x, y)
+    local vp = viewport()
+    local w = WIN_W * UserScale.Scale
+    local h = WIN_H * UserScale.Scale
+    local limX = vp.X / 2 + w / 2 - 70
+    local limY = vp.Y / 2 + h / 2 - 50
+    return math.clamp(x, -limX, limX), math.clamp(y, -limY, limY)
+end)
+
+-- Tabs
+local TABS = { "HOME", "DETECT", "STYLE" }
+
+local TabBar = make("Frame", {
+    Position = UDim2.new(0, 10, 0, 58),
+    Size = UDim2.new(1, -20, 0, 32),
+    BackgroundColor3 = PANEL,
+    BackgroundTransparency = 0.2,
+    BorderSizePixel = 0,
+}, Main)
+corner(TabBar, 9)
+
+local TabHighlight = make("Frame", {
+    Size = UDim2.new(1 / #TABS, -6, 1, -6),
+    Position = UDim2.new(0, 3, 0, 3),
+    BackgroundTransparency = 0.82,
+    BorderSizePixel = 0,
+}, TabBar)
+corner(TabHighlight, 7)
+bindAccent(TabHighlight, "BackgroundColor3")
+local hlStroke = stroke(TabHighlight, accent, 0.5, 1)
+bindAccent(hlStroke, "Color")
+
+local Content = make("Frame", {
+    Position = UDim2.new(0, 10, 0, 98),
+    Size = UDim2.new(1, -20, 1, -128),
+    BackgroundTransparency = 1,
+}, Main)
+
+label(Main, {
+    Size = UDim2.new(1, -24, 0, 16),
+    Position = UDim2.new(0, 12, 1, -22),
+    Text = isMobile and "Tap the - button to minimize  |  drag the header to move"
+        or "RightShift: toggle menu  |  drag the header to move",
+    TextSize = 10,
+    TextColor3 = MUTED,
+})
+
+-- ============================================================
+-- Components
+-- ============================================================
+
+local function createSlider(parent, name, min, max, default, fmt, callback)
+    local holder = card(parent, 48)
+    label(holder, { Size = UDim2.new(0.6, 0, 0, 18), Position = UDim2.new(0, 12, 0, 6), Text = name })
+    local valueLbl = label(holder, {
+        Size = UDim2.new(0.4, -12, 0, 18),
+        Position = UDim2.new(0.6, 0, 0, 6),
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Font = Enum.Font.GothamBold,
+    })
+
+    local hit = make("TextButton", {
+        Size = UDim2.new(1, -24, 0, 20),
+        Position = UDim2.new(0, 12, 0, 24),
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+    }, holder)
+
+    local bar = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 6),
+        Position = UDim2.new(0, 0, 0.5, -3),
+        BackgroundColor3 = Color3.fromRGB(46, 46, 58),
+        BorderSizePixel = 0,
+    }, hit)
+    corner(bar, 3)
+
+    local fill = make("Frame", { Size = UDim2.new(0, 0, 1, 0), BorderSizePixel = 0 }, bar)
+    corner(fill, 3)
+    bindAccent(fill, "BackgroundColor3")
+
+    local knob = make("Frame", {
+        Size = UDim2.new(0, 14, 0, 14),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, bar)
+    corner(knob, 7)
+
+    local current = nil
+    local function show(value)
+        local rel = (value - min) / (max - min)
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        knob.Position = UDim2.new(rel, 0, 0.5, 0)
+        valueLbl.Text = fmt(value)
+    end
+    show(default)
+    current = default
+
+    local function update(x)
+        local w = math.max(bar.AbsoluteSize.X, 1)
+        local rel = math.clamp((x - bar.AbsolutePosition.X) / w, 0, 1)
+        local value = math.floor(min + (max - min) * rel + 0.5)
+        if value == current then return end
+        current = value
+        show(value)
+        callback(value)
+    end
+
+    hit.InputBegan:Connect(function(input)
+        if isPointerStart(input) then
+            activeDrag = function(pos)
+                update(pos.X)
+            end
+            update(input.Position.X)
+        end
+    end)
+
+    return holder, function(v)
+        current = v
+        show(v)
+    end
+end
+
+local function createToggle(parent, text, default, callback)
+    local holder = card(parent, 38)
+    label(holder, { Size = UDim2.new(1, -70, 1, 0), Position = UDim2.new(0, 12, 0, 0), Text = text })
+
+    local track = make("TextButton", {
+        Size = UDim2.new(0, 40, 0, 22),
+        Position = UDim2.new(1, -52, 0.5, -11),
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        BackgroundColor3 = TRACK_OFF,
+    }, holder)
+    corner(track, 11)
+
+    local knob = make("Frame", {
+        Size = UDim2.new(0, 16, 0, 16),
+        Position = UDim2.new(0, 3, 0.5, -8),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 8)
+
+    local on = default
+
+    local function render(animate)
+        local goalPos = on and UDim2.new(0, 21, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
+        local goalCol = on and accent or TRACK_OFF
+        if animate then
+            tween(knob, 0.16, { Position = goalPos }, Enum.EasingStyle.Back)
+            tween(track, 0.16, { BackgroundColor3 = goalCol })
+        else
+            knob.Position = goalPos
+            track.BackgroundColor3 = goalCol
+        end
+    end
+
+    render(false)
+    onAccent(function()
+        if track.Parent then render(true) end
+    end)
+
+    track.MouseButton1Click:Connect(function()
+        on = not on
+        render(true)
+        callback(on)
+    end)
+
+    return holder, function(v)
+        on = v
+        render(true)
+    end
+end
+
+local function createSegmented(parent, title, options, default, callback)
+    local holder = card(parent, 56)
+    label(holder, {
+        Size = UDim2.new(1, -24, 0, 14),
+        Position = UDim2.new(0, 12, 0, 6),
+        Text = title,
+        TextSize = 10,
+        TextColor3 = MUTED,
+        Font = Enum.Font.GothamBold,
+    })
+
+    local row = make("Frame", {
+        Size = UDim2.new(1, -24, 0, 26),
+        Position = UDim2.new(0, 12, 0, 24),
+        BackgroundTransparency = 1,
+    }, holder)
+
+    local selected = default
+    local btns = {}
+    local count = #options
+
+    local function render()
+        for i, b in ipairs(btns) do
+            local sel = (i == selected)
+            tween(b, 0.15, {
+                BackgroundColor3 = sel and accent or CONTROL,
+                TextColor3 = sel and WHITE or MUTED,
+            })
+        end
+    end
+
+    for i, opt in ipairs(options) do
+        local b = make("TextButton", {
+            Size = UDim2.new(1 / count, -4, 1, 0),
+            Position = UDim2.new((i - 1) / count, 2, 0, 0),
+            BackgroundColor3 = CONTROL,
+            Text = opt,
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
+            TextColor3 = MUTED,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+        }, row)
+        corner(b, 7)
+        btns[i] = b
+        b.MouseButton1Click:Connect(function()
+            selected = i
+            render()
+            callback(i)
+        end)
+    end
+
+    render()
+    onAccent(function()
+        if holder.Parent then render() end
+    end)
+    return holder
+end
+
+local function createButton(parent, text, height, callback)
+    local b = make("TextButton", {
+        Size = UDim2.new(1, 0, 0, height),
+        BackgroundColor3 = CONTROL,
+        Text = text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = TEXT,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+    }, parent)
+    corner(b, 9)
+    hoverable(b, CONTROL, CONTROL_HOVER)
+    b.MouseButton1Click:Connect(function()
+        callback(b)
+    end)
+    return b
+end
+
+local function newPage()
+    local page = make("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = MUTED,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Visible = false,
+    }, Content)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, page)
+    make("UIPadding", { PaddingRight = UDim.new(0, 6) }, page)
+    return page
+end
+
+-- Updaters only run for the visible tab (tab 0 = always).
+local updaters = {}
+local currentTab = 1
+local menuOpen = true
+
+local function addUpdater(tab, fn)
+    updaters[#updaters + 1] = { tab = tab, fn = fn }
+end
+
+local function runUpdaters()
+    for _, u in ipairs(updaters) do
+        if u.tab == 0 or (menuOpen and u.tab == currentTab) then
+            local ok, err = pcall(u.fn)
+            if not ok and state.Log then
+                warn("[Vanish] UI update error: " .. tostring(err))
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- Pages
+-- ============================================================
+
+local function buildHome(page)
+    local status = card(page, 60)
+    status.LayoutOrder = 1
+    stroke(status, WHITE, 0.88, 1)
+    local dot = make("Frame", {
+        Size = UDim2.new(0, 12, 0, 12),
+        Position = UDim2.new(0, 16, 0, 16),
+        BackgroundColor3 = GOOD,
+        BorderSizePixel = 0,
+    }, status)
+    corner(dot, 6)
+    local title = label(status, {
+        Size = UDim2.new(1, -50, 0, 20),
+        Position = UDim2.new(0, 38, 0, 11),
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+    })
+    local sub = label(status, {
+        Size = UDim2.new(1, -50, 0, 16),
+        Position = UDim2.new(0, 38, 0, 33),
+        TextSize = 11,
+        TextColor3 = MUTED,
+    })
+
+    local statsRow = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 52),
+        BackgroundTransparency = 1,
+        LayoutOrder = 2,
+    }, page)
+    make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, statsRow)
+
+    local function statCell(order, cap)
+        local c = make("Frame", {
+            Size = UDim2.new(1 / 3, -6, 1, 0),
+            BackgroundColor3 = CARD,
+            BackgroundTransparency = 0.2,
+            BorderSizePixel = 0,
+            LayoutOrder = order,
+        }, statsRow)
+        corner(c, 9)
+        stroke(c, WHITE, 0.94, 1)
+        local v = label(c, {
+            Size = UDim2.new(1, 0, 0, 22),
+            Position = UDim2.new(0, 0, 0, 8),
+            Font = Enum.Font.GothamBold,
+            TextSize = 16,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            Text = "0",
+        })
+        label(c, {
+            Size = UDim2.new(1, 0, 0, 12),
+            Position = UDim2.new(0, 0, 0, 32),
+            Text = cap,
+            TextSize = 9,
+            TextColor3 = MUTED,
+            Font = Enum.Font.GothamBold,
+            TextXAlignment = Enum.TextXAlignment.Center,
+        })
+        return v
+    end
+
+    local pingVal = statCell(1, "PING (MS)")
+    local limitedVal = statCell(2, "LIMITED")
+    local flaggedVal = statCell(3, "FLAGGED")
+
+    local t = createToggle(page, "Remote limiter", state.Enabled, function(on)
+        state.Enabled = on
+        config.enabled = on
+        saveConfig()
+    end)
+    t.LayoutOrder = 3
+
+    local s1 = createSlider(page, "Burst Limit", 10, 80, state.BurstLimit, function(v)
+        return v .. " calls"
+    end, function(v)
+        state.BurstLimit = v
+        bucket.tokens = math.min(bucket.tokens, v)
+        config.burst = v
+        saveConfig()
+    end)
+    s1.LayoutOrder = 4
+
+    local s2 = createSlider(page, "Max PPS", 10, 120, state.MaxPPS, function(v)
+        return v .. " /s"
+    end, function(v)
+        state.MaxPPS = v
+        config.pps = v
+        saveConfig()
+    end)
+    s2.LayoutOrder = 5
+
+    local graph = card(page, 60)
+    graph.LayoutOrder = 6
+    label(graph, {
+        Size = UDim2.new(0.5, 0, 0, 16),
+        Position = UDim2.new(0, 12, 0, 5),
+        Text = "PING HISTORY",
+        TextSize = 10,
+        TextColor3 = MUTED,
+        Font = Enum.Font.GothamBold,
+    })
+    local area = make("Frame", {
+        Position = UDim2.new(0, 12, 0, 24),
+        Size = UDim2.new(1, -24, 1, -30),
+        BackgroundTransparency = 1,
+    }, graph)
+
+    local N = 36
+    local samples = {}
+    local bars = {}
+    for i = 1, N do
+        samples[i] = 0
+        bars[i] = make("Frame", {
+            AnchorPoint = Vector2.new(0, 1),
+            Position = UDim2.new((i - 1) / N, 0, 1, 0),
+            Size = UDim2.new(1 / N, -2, 0.05, 0),
+            BackgroundColor3 = GOOD,
+            BorderSizePixel = 0,
+        }, area)
+        corner(bars[i], 1)
+    end
+
+    local resetBtn = createButton(page, "RESET COUNTER", 32, function()
+        state.totalDropped = 0
+    end)
+    resetBtn.LayoutOrder = 7
+
+    -- Sampling keeps running even when the tab is hidden, drawing only when visible.
+    addUpdater(0, function()
+        table.remove(samples, 1)
+        samples[N] = state.ping
+    end)
+
+    addUpdater(1, function()
+        local c, txt
+        if not state.hookOk then
+            c, txt = WARN, "LIMITER UNAVAILABLE"
+        elseif state.Enabled then
+            c, txt = GOOD, "PROTECTION ACTIVE"
+        else
+            c, txt = BAD, "LIMITER OFF"
+        end
+        dot.BackgroundColor3 = c
+        title.Text = txt
+        title.TextColor3 = c
+        sub.Text = state.selfLagging and "Your connection is unstable" or "Monitoring remote traffic"
+
+        pingVal.Text = tostring(math.floor(state.ping))
+        limitedVal.Text = tostring(state.totalDropped)
+        flaggedVal.Text = tostring(#state.flagged)
+        flaggedVal.TextColor3 = (#state.flagged > 0) and BAD or TEXT
+
+        for i = 1, N do
+            local v = samples[i]
+            local b = bars[i]
+            b.Size = UDim2.new(1 / N, -2, math.clamp(v / 300, 0.05, 1), 0)
+            b.BackgroundColor3 = (v < 100 and GOOD) or (v < 200 and WARN) or BAD
+        end
+    end)
+end
+
+local function buildDetect(page)
+    local banner = card(page, 48)
+    banner.LayoutOrder = 1
+    local bStroke = stroke(banner, GOOD, 0.5, 1)
+    local bText = label(banner, {
+        Size = UDim2.new(1, -20, 1, 0),
+        Position = UDim2.new(0, 10, 0, 0),
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    })
+
+    local seg = createSegmented(page, "SENSITIVITY", { "LOW", "MEDIUM", "HIGH" }, config.sens, function(i)
+        config.sens = i
+        applySens(i)
+        saveConfig()
+    end)
+    seg.LayoutOrder = 2
+
+    local t1 = createToggle(page, "Highlight flagged players", state.Highlight, function(on)
+        state.Highlight = on
+        config.highlight = on
+        saveConfig()
+    end)
+    t1.LayoutOrder = 3
+
+    local t2 = createToggle(page, "Pop-up alerts", state.Alerts, function(on)
+        state.Alerts = on
+        config.alerts = on
+        saveConfig()
+    end)
+    t2.LayoutOrder = 4
+
+    local cap = caption(page, "PLAYERS")
+    cap.LayoutOrder = 5
+
+    local listFrame = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundColor3 = CARD,
+        BackgroundTransparency = 0.2,
+        BorderSizePixel = 0,
+        LayoutOrder = 6,
+    }, page)
+    corner(listFrame, 9)
+    stroke(listFrame, WHITE, 0.94, 1)
+    make("UIPadding", {
+        PaddingTop = UDim.new(0, 6),
+        PaddingBottom = UDim.new(0, 6),
+        PaddingLeft = UDim.new(0, 6),
+        PaddingRight = UDim.new(0, 6),
+    }, listFrame)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, listFrame)
+
+    local emptyLbl = label(listFrame, {
+        Size = UDim2.new(1, 0, 0, 22),
+        Text = "No other players in the server",
+        TextColor3 = MUTED,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Visible = false,
+    })
+
+    local rows = {}
+
+    local function createRow(plr)
+        local f = make("Frame", {
+            Size = UDim2.new(1, 0, 0, 28),
+            BackgroundColor3 = Color3.fromRGB(38, 38, 50),
+            BackgroundTransparency = 0.35,
+            BorderSizePixel = 0,
+        }, listFrame)
+        corner(f, 7)
+        local n = label(f, {
+            Size = UDim2.new(1, -92, 1, 0),
+            Position = UDim2.new(0, 10, 0, 0),
+            Text = plr.DisplayName,
+            TextSize = 11,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        })
+        local chip = label(f, {
+            Size = UDim2.new(0, 76, 0, 20),
+            Position = UDim2.new(1, -82, 0.5, -10),
+            BackgroundColor3 = GOOD,
+            BackgroundTransparency = 0.8,
+            Font = Enum.Font.GothamBold,
+            TextSize = 10,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            TextColor3 = GOOD,
+            Text = "OK",
+        })
+        corner(chip, 6)
+        return { frame = f, name = n, chip = chip, txt = "OK", dname = plr.DisplayName, order = -1 }
+    end
+
+    local function updateList()
+        local seen = {}
+        local count = 0
+        for i = 1, #playerList do
+            local plr = playerList[i]
+            seen[plr] = true
+            count += 1
+            local row = rows[plr]
+            if not row then
+                row = createRow(plr)
+                rows[plr] = row
+            end
+
+            local tr = tracks[plr]
+            local st = tr and tr.status or "OK"
+            local col, txt = GOOD, "OK"
+            if st == "SPIKE" then
+                col, txt = BAD, "SPIKE x" .. tr.spikes
+            elseif st == "FROZEN" then
+                col, txt = WARN, "FROZEN"
+            end
+
+            if row.txt ~= txt then
+                row.txt = txt
+                row.chip.Text = txt
+                row.chip.TextColor3 = col
+                row.chip.BackgroundColor3 = col
+            end
+            if row.dname ~= plr.DisplayName then
+                row.dname = plr.DisplayName
+                row.name.Text = plr.DisplayName
+            end
+            local order = (st ~= "OK" and 0 or 1000) + i
+            if row.order ~= order then
+                row.order = order
+                row.frame.LayoutOrder = order
+            end
+        end
+
+        for plr, row in pairs(rows) do
+            if not seen[plr] then
+                row.frame:Destroy()
+                rows[plr] = nil
+            end
+        end
+
+        emptyLbl.Visible = (count == 0)
+    end
+
+    addUpdater(2, function()
+        local flagged = state.flagged
+        local c, txt
+        if state.selfLagging then
+            c, txt = WARN, "YOUR CONNECTION IS UNSTABLE\nDetection paused"
+        elseif #flagged > 0 then
+            local names = {}
+            for i = 1, #flagged do
+                local plr = flagged[i]
+                local tr = tracks[plr]
+                local n = plr.DisplayName
+                if tr and tr.spikes > 0 then
+                    n = n .. " x" .. tr.spikes
+                end
+                names[i] = n
+            end
+            c, txt = BAD, "LAG SWITCH DETECTED\n" .. table.concat(names, ", ")
+        else
+            c, txt = GOOD, "ALL CLEAR\nNo lag switchers detected"
+        end
+        bText.Text = txt
+        bText.TextColor3 = c
+        bStroke.Color = c
+        updateList()
+    end)
+end
+
+local backgroundsBuilt = false
+local buildBackgroundGrid
+local setMenuSizeUI = nil
+
+local function buildStyle(page)
+    local sw = card(page, 56)
+    sw.LayoutOrder = 1
+    label(sw, {
+        Size = UDim2.new(1, -24, 0, 14),
+        Position = UDim2.new(0, 12, 0, 6),
+        Text = "ACCENT COLOR",
+        TextSize = 10,
+        TextColor3 = MUTED,
+        Font = Enum.Font.GothamBold,
+    })
+
+    local swStrokes = {}
+    for i, col in ipairs(ACCENTS) do
+        local b = make("TextButton", {
+            Size = UDim2.new(0, 24, 0, 24),
+            Position = UDim2.new(0, 12 + (i - 1) * 34, 0, 26),
+            BackgroundColor3 = col,
+            Text = "",
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+        }, sw)
+        corner(b, 12)
+        swStrokes[i] = stroke(b, WHITE, i == config.accent and 0 or 1, 2)
+        b.MouseButton1Click:Connect(function()
+            setAccent(i)
+            for j, s in ipairs(swStrokes) do
+                tween(s, 0.15, { Transparency = (j == i) and 0 or 1 })
+            end
+        end)
+    end
+
+    local o = createSlider(page, "Background opacity", 0, 100, config.bgOpacity, function(v)
+        return v .. "%"
+    end, function(v)
+        config.bgOpacity = v
+        BgImage.ImageTransparency = 1 - v / 100
+        saveConfig()
+    end)
+    o.LayoutOrder = 2
+
+    local setAuto
+    local m, setMenuSize = createSlider(page, "Menu size", 50, 120,
+        math.floor(effectiveScale() * 100 + 0.5), function(v)
+        return v .. "%"
+    end, function(v)
+        config.scale = v
+        config.autoScale = false
+        if setAuto then setAuto(false) end
+        applyUiScale(v / 100)
+        saveConfig()
+    end)
+    m.LayoutOrder = 3
+    setMenuSizeUI = setMenuSize
+
+    local autoT
+    autoT, setAuto = createToggle(page, "Auto size (detect device)", config.autoScale, function(on)
+        config.autoScale = on
+        local s = on and effectiveScale() or (config.scale / 100)
+        applyUiScale(s)
+        setMenuSize(math.floor(s * 100 + 0.5))
+        saveConfig()
+    end)
+    autoT.LayoutOrder = 4
+
+    local cap = caption(page, "BACKGROUND")
+    cap.LayoutOrder = 5
+
+    -- The 15 thumbnails are built the first time the Style tab opens, not at startup.
+    local grid = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundColor3 = CARD,
+        BackgroundTransparency = 0.2,
+        BorderSizePixel = 0,
+        LayoutOrder = 6,
+    }, page)
+    corner(grid, 9)
+    stroke(grid, WHITE, 0.94, 1)
+    make("UIPadding", {
+        PaddingTop = UDim.new(0, 6),
+        PaddingBottom = UDim.new(0, 6),
+        PaddingLeft = UDim.new(0, 6),
+        PaddingRight = UDim.new(0, 6),
+    }, grid)
+    make("UIGridLayout", {
+        CellSize = UDim2.new(0.32, 0, 0, 56),
+        CellPadding = UDim2.new(0, 6, 0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, grid)
+
+    buildBackgroundGrid = function()
+        if backgroundsBuilt then return end
+        backgroundsBuilt = true
+        local bgStrokes = {}
+        for i, asset in ipairs(BACKGROUNDS) do
+            local b = make("ImageButton", {
+                BackgroundColor3 = Color3.fromRGB(30, 30, 40),
+                Image = asset,
+                ScaleType = Enum.ScaleType.Crop,
+                AutoButtonColor = false,
+                LayoutOrder = i,
+                BorderSizePixel = 0,
+            }, grid)
+            corner(b, 7)
+            local s = stroke(b, accent, i == config.bg and 0 or 1, 2)
+            bindAccent(s, "Color")
+            bgStrokes[i] = s
+
+            local num = label(b, {
+                Size = UDim2.new(0, 20, 0, 14),
+                Position = UDim2.new(0, 4, 0, 4),
+                BackgroundColor3 = Color3.new(0, 0, 0),
+                BackgroundTransparency = 0.4,
+                Text = tostring(i),
+                Font = Enum.Font.GothamBold,
+                TextSize = 10,
+                TextXAlignment = Enum.TextXAlignment.Center,
+            })
+            corner(num, 4)
+
+            b.MouseButton1Click:Connect(function()
+                config.bg = i
+                BgImage.Image = asset
+                for j, st in ipairs(bgStrokes) do
+                    tween(st, 0.15, { Transparency = (j == i) and 0 or 1 })
+                end
+                saveConfig()
+            end)
+        end
+    end
+
+    local unloadArmed = false
+    local unloadBtn = createButton(page, "UNLOAD VANISH", 32, function(btn)
+        if not unloadArmed then
+            unloadArmed = true
+            btn.Text = "TAP AGAIN TO UNLOAD"
+            btn.TextColor3 = BAD
+            task.delay(3, function()
+                if btn.Parent and not state.unloaded then
+                    unloadArmed = false
+                    btn.Text = "UNLOAD VANISH"
+                    btn.TextColor3 = TEXT
+                end
+            end)
+            return
+        end
+        state.unloaded = true
+        state.Enabled = false
+        for _, c in ipairs(conns) do
+            pcall(function() c:Disconnect() end)
+        end
+        for _, t in pairs(tracks) do
+            setHighlight(t, false)
+        end
+        ScreenGui:Destroy()
+    end)
+    unloadBtn.LayoutOrder = 7
+end
+
+local pages = {}
+for i = 1, #TABS do
+    pages[i] = newPage()
+end
+
+buildHome(pages[1])
+buildDetect(pages[2])
+buildStyle(pages[3])
+
+local tabButtons = {}
+
+local function selectTab(i)
+    currentTab = i
+    for idx, p in ipairs(pages) do
+        p.Visible = (idx == i)
+    end
+    for idx, b in ipairs(tabButtons) do
+        tween(b, 0.15, { TextColor3 = (idx == i) and TEXT or MUTED })
+    end
+    tween(TabHighlight, 0.22, { Position = UDim2.new((i - 1) / #TABS, 3, 0, 3) }, Enum.EasingStyle.Quint)
+    if i == 3 and buildBackgroundGrid then
+        task.defer(buildBackgroundGrid)
+    end
+    runUpdaters()
+end
+
+for i, name in ipairs(TABS) do
+    local b = make("TextButton", {
+        Size = UDim2.new(1 / #TABS, 0, 1, 0),
+        Position = UDim2.new((i - 1) / #TABS, 0, 0, 0),
+        BackgroundTransparency = 1,
+        Text = name,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = MUTED,
+        AutoButtonColor = false,
+        ZIndex = 2,
+    }, TabBar)
+    tabButtons[i] = b
+    b.MouseButton1Click:Connect(function()
+        selectTab(i)
+    end)
+end
+
+-- ============================================================
+-- Pill, toasts, menu toggle
+-- ============================================================
+
+-- Pill sits top-center, just under the Roblox top bar. Raise or lower it here.
+local PILL_TOP = 64
+
+local Pill = make("TextButton", {
+    Name = "OpenPill",
+    Size = UDim2.new(0, 150, 0, 46),
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, PILL_TOP),
+    BackgroundColor3 = PANEL,
+    Text = "VANISH",
+    Font = Enum.Font.GothamBlack,
+    TextSize = 14,
+    TextColor3 = TEXT,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    Visible = false,
+}, ScreenGui)
+corner(Pill, 23)
+stroke(Pill, WHITE, 0.8, 1)
+make("UIPadding", { PaddingLeft = UDim.new(0, 46) }, Pill)
+hoverable(Pill, PANEL, Color3.fromRGB(30, 30, 42))
+
+local PillDot = make("Frame", {
+    Size = UDim2.new(0, 12, 0, 12),
+    Position = UDim2.new(0, -30, 0.5, -6),
+    BackgroundColor3 = GOOD,
+    BorderSizePixel = 0,
+}, Pill)
+corner(PillDot, 6)
+
+local ToastHolder = make("Frame", {
+    Size = UDim2.new(0, 280, 0, 200),
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, PILL_TOP + 54),
+    BackgroundTransparency = 1,
+}, ScreenGui)
+make("UIListLayout", {
+    Padding = UDim.new(0, 6),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+    HorizontalAlignment = Enum.HorizontalAlignment.Center,
+}, ToastHolder)
+local ToastScale = make("UIScale", { Scale = math.min(UserScale.Scale, 1) }, ToastHolder)
+extraScales[#extraScales + 1] = ToastScale
+
+local toastSeq = 0
+local function toast(text, color)
+    toastSeq += 1
+    local active = {}
+    for _, ch in ipairs(ToastHolder:GetChildren()) do
+        if ch:IsA("Frame") then active[#active + 1] = ch end
+    end
+    if #active >= 4 then
+        table.sort(active, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+        active[1]:Destroy()
+    end
+
+    local f = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 34),
+        BackgroundColor3 = Color3.fromRGB(24, 24, 32),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        LayoutOrder = toastSeq,
+    }, ToastHolder)
+    corner(f, 9)
+    local s = stroke(f, color, 1, 1)
+    local bar = make("Frame", {
+        Size = UDim2.new(0, 3, 1, -14),
+        Position = UDim2.new(0, 8, 0, 7),
+        BackgroundColor3 = color,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, f)
+    corner(bar, 2)
+    local l = label(f, {
+        Size = UDim2.new(1, -28, 1, 0),
+        Position = UDim2.new(0, 20, 0, 0),
+        Text = text,
+        TextColor3 = color,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextTransparency = 1,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+
+    tween(f, 0.2, { BackgroundTransparency = 0.08 })
+    tween(s, 0.2, { Transparency = 0.35 })
+    tween(bar, 0.2, { BackgroundTransparency = 0 })
+    tween(l, 0.2, { TextTransparency = 0 })
+
+    task.delay(3.5, function()
+        if not f.Parent then return end
+        tween(f, 0.25, { BackgroundTransparency = 1 })
+        tween(s, 0.25, { Transparency = 1 })
+        tween(bar, 0.25, { BackgroundTransparency = 1 })
+        tween(l, 0.25, { TextTransparency = 1 })
+        task.delay(0.3, function()
+            if f.Parent then f:Destroy() end
+        end)
+    end)
+end
+
+state.onFlag = function(plr)
+    if state.Alerts then
+        toast("LAG ALERT: " .. plr.DisplayName, BAD)
+    end
+end
+
+local function setMenuVisible(v)
+    if v == menuOpen then return end
+    menuOpen = v
+    if v then
+        Pill.Visible = false
+        Root.Visible = true
+        OpenScale.Scale = 0.92
+        Main.GroupTransparency = 1
+        tween(OpenScale, 0.25, { Scale = 1 }, Enum.EasingStyle.Back)
+        tween(Main, 0.2, { GroupTransparency = 0 })
+        task.delay(0.4, function()
+            if menuOpen and not state.unloaded then
+                OpenScale.Scale = 1
+                Main.GroupTransparency = 0
+            end
+        end)
+        runUpdaters()
+    else
+        tween(OpenScale, 0.15, { Scale = 0.92 })
+        tween(Main, 0.15, { GroupTransparency = 1 })
+        task.delay(0.16, function()
+            if not menuOpen and not state.unloaded then
+                Root.Visible = false
+                Pill.Visible = true
+            end
+        end)
+    end
+end
+
+CloseBtn.MouseButton1Click:Connect(function()
+    setMenuVisible(false)
+end)
+
+Pill.MouseButton1Click:Connect(function()
+    setMenuVisible(true)
+end)
+
+connect(UserInputService.InputBegan, function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        setMenuVisible(not menuOpen)
+    end
+end)
+
+addUpdater(0, function()
+    if state.selfLagging then
+        PillDot.BackgroundColor3 = WARN
+    elseif #state.flagged > 0 then
+        PillDot.BackgroundColor3 = BAD
+    else
+        PillDot.BackgroundColor3 = GOOD
+    end
+end)
+
+local acc = 0
+connect(RunService.Heartbeat, function(dt)
+    if state.unloaded then return end
+    acc += dt
+    if acc < 0.25 then return end
+    acc = 0
+    runUpdaters()
+end)
+
+-- ============================================================
+-- Show
+-- ============================================================
+
+local function watchViewport()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    connect(cam:GetPropertyChangedSignal("ViewportSize"), function()
+        if config.autoScale and not state.unloaded then
+            local s = effectiveScale()
+            applyUiScale(s)
+            if setMenuSizeUI then
+                setMenuSizeUI(math.floor(s * 100 + 0.5))
+            end
+        end
+    end)
+end
+watchViewport()
+
+selectTab(1)
+ScreenGui.Parent = GuiParent
+
+print("[Vanish Anti Packet Lagger v4] Loaded")
+
+end, function(e)
+    return debug.traceback(tostring(e), 2)
+end)
+
+if not uiOk then
+    state.unloaded = true
+    state.Enabled = false
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    if ScreenGui then pcall(function() ScreenGui:Destroy() end) end
+    warn("[Vanish] UI failed to build:\n" .. tostring(uiErr))
+end
